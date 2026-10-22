@@ -1,8 +1,7 @@
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
-const puppeteer = require('puppeteer');
-const path = require('path');
+const { chromium } = require('playwright-core');
 
 const app = express();
 const server = http.createServer(app);
@@ -10,33 +9,32 @@ const wss = new WebSocket.Server({ server });
 const PORT = process.env.PORT || 3000;
 
 let browserInstance = null;
+let contextInstance = null;
 let pageInstance = null;
 
-// Serve interactive frontend interface
 app.get('/', (req, res) => {
     res.send(`
         <!DOCTYPE html>
         <html>
         <head>
-            <title>Cloud-Sphere Interactive Browser</title>
+            <title>Cloud-Sphere Stream</title>
             <style>
                 body { margin: 0; background: #111; color: white; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; overflow: hidden; }
                 #controls { margin-bottom: 10px; width: 100%; max-width: 800px; display: flex; gap: 5px; }
                 input { flex: 1; padding: 10px; border-radius: 4px; border: none; }
                 button { padding: 10px 20px; background: #8a2be2; color: white; border: none; border-radius: 4px; cursor: pointer; }
-                #browser-view { width: 100%; max-width: 800px; height: 500px; background: #000; border: 2px solid #333; position: relative; cursor: crosshair; }
+                #browser-view { width: 100%; max-width: 800px; height: 500px; background: #000; border: 2px solid #333; position: relative; }
                 img { width: 100%; height: 100%; object-fit: contain; }
             </style>
         </head>
         <body>
             <div id="controls">
-                <input type="text" id="url-input" value="https://google.com" placeholder="Enter URL...">
+                <input type="text" id="url-input" value="https://google.com">
                 <button onclick="navigateToUrl()">Go</button>
             </div>
-            <div id="browser-view" id="view-box">
-                <img id="screen-stream" src="" alt="Waiting for browser engine to launch..." />
+            <div id="browser-view">
+                <img id="screen-stream" src="" alt="Launching ultra-lightweight engine..." />
             </div>
-
             <script>
                 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
                 const ws = new WebSocket(protocol + '//' + window.location.host);
@@ -46,17 +44,14 @@ app.get('/', (req, res) => {
                 ws.onmessage = (event) => {
                     if (typeof event.data === 'string') {
                         const msg = JSON.parse(event.data);
-                        if (msg.type === 'screenshot') {
-                            screen.src = 'data:image/jpeg;base64,' + msg.data;
-                        }
+                        if (msg.type === 'screenshot') screen.src = 'data:image/jpeg;base64,' + msg.data;
                     }
                 };
 
-                // Track and send interactive click coordinates back to server
                 viewBox.addEventListener('click', (e) => {
                     const rect = viewBox.getBoundingClientRect();
-                    const x = ((e.clientX - rect.left) / rect.width) * 800;
-                    const y = ((e.clientY - rect.top) / rect.height) * 500;
+                    const x = Math.round(((e.clientX - rect.left) / rect.width) * 800);
+                    const y = Math.round(((e.clientY - rect.top) / rect.height) * 500);
                     ws.send(JSON.stringify({ type: 'click', x, y }));
                 });
 
@@ -70,50 +65,47 @@ app.get('/', (req, res) => {
     `);
 });
 
-// Handle live streaming connections and interactions
 wss.on('connection', async (ws) => {
-    console.log('Client connected to interactive socket stream');
-    
     if (!browserInstance) {
-        browserInstance = await puppeteer.launch({
-            headless: true,
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--enable-sandbox', '--site-per-process', '--user-data-dir=./.browser-sessions/profile-1']
-        });
-        pageInstance = await browserInstance.newPage();
-        await pageInstance.setViewport({ width: 800, height: 500 });
-        await pageInstance.goto('https://google.com');
+        try {
+            browserInstance = await chromium.launch({
+                headless: true,
+                executablePath: '/usr/bin/chromium-browser', // Uses Render's native minimal binary
+                args: [
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage', // Saves memory usage
+                    '--disable-accelerated-2d-canvas',
+                    '--no-first-run',
+                    '--no-zygote',
+                    '--single-process', // Forces low RAM foot-print
+                    '--user-data-dir=./.browser-sessions/profile-1'
+                ]
+            });
+            contextInstance = await browserInstance.newContext({ viewport: { width: 800, height: 500 } });
+            pageInstance = await contextInstance.newPage();
+            await pageInstance.goto('https://google.com');
+        } catch (e) { console.error("Launch error: ", e); }
     }
 
-    // Interval stream to pipe visual browser updates down to the canvas client
     const streamInterval = setInterval(async () => {
         if (pageInstance && ws.readyState === WebSocket.OPEN) {
             try {
-                const screenshot = await pageInstance.screenshot({ type: 'jpeg', quality: 60, encoding: 'base64' });
-                ws.send(JSON.stringify({ type: 'screenshot', data: screenshot }));
-            } catch (err) {
-                // Ignore transient frame errors
-            }
+                const buffer = await pageInstance.screenshot({ type: 'jpeg', quality: 40 });
+                ws.send(JSON.stringify({ type: 'screenshot', data: buffer.toString('base64') }));
+            } catch (err) {}
         }
-    }, 200);
+    }, 300);
 
     ws.on('message', async (message) => {
-        const action = JSON.parse(message);
         try {
-            if (action.type === 'click' && pageInstance) {
-                await pageInstance.mouse.click(action.x, action.y);
-            } else if (action.type === 'navigate' && pageInstance) {
-                await pageInstance.goto(action.url);
-            }
-        } catch (e) {
-            console.error(e);
-        }
+            const action = JSON.parse(message);
+            if (action.type === 'click' && pageInstance) await pageInstance.mouse.click(action.x, action.y);
+            if (action.type === 'navigate' && pageInstance) await pageInstance.goto(action.url);
+        } catch (e) {}
     });
 
-    ws.on('close', () => {
-        clearInterval(streamInterval);
-    });
+    ws.on('close', () => clearInterval(streamInterval));
 });
 
-server.listen(PORT, () => {
-    console.log(`Interactive platform running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`Server listening`));
